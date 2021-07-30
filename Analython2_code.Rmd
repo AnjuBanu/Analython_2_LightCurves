@@ -1,0 +1,461 @@
+---
+title: <center> <h1>Analython-2 Classification of Astronomical light curves</h1> </center>
+mainfont: Arial
+output:
+  pdf_document:
+    latex_engine: xelatex
+sansfont: Arial
+fig_crop: false
+classoption: portrait
+fontsize: 14pt
+geometry: margin=0.5in
+---
+
+## ABSTRACT
+
+This report aims to represents my analysis by clustering out the supernovae with there light curve shape and understand different patterns.
+
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+# Loading the necessary packages 
+packages <- c('dplyr','ggplot2','tidyverse','readxl','plotly','tidyr','readxl','corrplot','naniar','Rcpp','caret','caTools','factoextra','visdat','cvms','dplyr','stringr','data.table',"epitools","dtwclust","roll")
+
+install_package <- packages %in% row.names(installed.packages())
+if (any (install_package ==  FALSE))
+  install.packages(packages[!install_package])
+
+sapply(packages, require, character.only = TRUE)
+```
+
+
+## DATA PREPROCESSING
+
+- Extracting useful feature "MDF","uJy","duJy","F","chi/N" from the given 645 raw text files
+  Note: MDF = Modfied Julian Date, uJy = Flux (Luminosity), duJy = Error in Flux, F = Telescope used to    capture (o/c), chi/N=Quality
+- Rename the feature with a valid name "julian_date", "flux", "error_flux", "filter", "quality"
+- Extract the unique Id from the file names and create a new column "series"
+- Remove the impact of distance from flux by applying formula and create new column value "flux_intrinsic"
+
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+
+datafr = data.frame()
+txt_col =  c("###MJD","uJy","duJy","F","chi/N")
+df_col = c("julian_date","flux","error_flux","filter","quality","flux_intrinsic","series")
+filelist = list.files(path = "./data/", pattern = ".*.txt")
+
+
+#assuming tab separated values with a header  
+readFile <- function (x){
+  name = substring(x, 21,24)
+  data_file = fread(paste0("./data/",x), select = c("###MJD","uJy","duJy","F","chi/N"))
+  data_file = data_file %>%
+    mutate(series = name)
+    colnames(data_file)<- c("julian_date","flux","error_flux","filter","quality","series")
+  data_file = data_file %>%
+  mutate (filter = as.factor(filter))
+  return (data_file)
+} 
+
+
+distance <- read_csv( "object_distances.csv")
+i=1
+formatFlux <-function (x){
+  x = x %>%
+    mutate (flux_intrinsic = 4*pi*(distance$distance_mpc[i]^2)*flux)
+  i=i+1
+  return (x)
+}
+
+datalist = lapply(filelist, function(x) readFile(x))
+datalist = lapply(datalist, function(x) formatFlux(x))
+
+datafr = do.call("rbind", datalist)
+
+```
+
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+head(datafr)
+```
+
+## FEATURE ENGINEERING
+
+ - Apart from "o" and "c" there are around 198 entries with filter name "t", This is irrelevant and hence to be removed
+ 
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+datafr %>%
+  group_by(filter)%>%
+  count()%>%
+  ggplot(aes(x=filter,y=n, fill=filter)) +
+  geom_col()+
+  geom_text(
+     aes(label=n),
+     vjust = -0.1)+
+  scale_fill_brewer(palette = "Set1")+
+  labs(y="Observation Count", x="", title = "Filter Count")+
+  theme_classic()+
+  theme(legend.position = "none")
+
+datafr <- datafr %>%
+  filter (filter != "t")
+
+```
+
+- There are around 78 NA entries in Quality column and these are removed from the data set
+ 
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+
+data.frame("Total_NA" = colSums(is.na(datafr))) %>%
+    mutate ("Percentage_of_NA" = (colSums(is.na(datafr))/dim(datafr)[1]) %>% 
+            round (4) * 100) %>%
+    arrange (desc(Total_NA))
+
+datafr =na.omit(datafr)
+
+```
+ 
+ - There are plenty of outliers seen in the Error and Quality features and these are been removed from dataset
+ 
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+datafr %>%
+  select ( c(flux,flux_intrinsic,error_flux,quality,filter))%>%
+  group_by(filter)%>%
+  ggplot(aes(y=quality,x=filter))+
+  geom_boxplot()+
+  theme_minimal()
+
+datafr %>%
+  select ( c(flux,flux_intrinsic,error_flux,quality,filter))%>%
+  group_by(filter)%>%
+  ggplot(aes(y=error_flux,x=filter))+
+  geom_boxplot()+
+  theme_minimal()
+
+# Remove the outliers from the quality and error_flux datadata 
+
+max_quality = (quantile(datafr$quality)[4] + 1.5*IQR(datafr$quality))
+min_quality = (quantile(datafr$quality)[2] - 1.5*IQR(datafr$quality))
+
+max_error = (quantile(datafr$error_flux)[4] + 1.5*IQR(datafr$error_flux))
+min_error = (quantile(datafr$error_flux)[2] - 1.5*IQR(datafr$error_flux))
+
+
+datafr <- datafr %>%
+  filter (quality>min_quality & quality < max_quality)%>%
+  filter (error_flux>min_error & error_flux<max_error)
+
+
+```
+ 
+ 
+ 
+ - The Modified julian date is convert Calendar date by creating a new column for better understanding 
+ 
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+
+datafr_o <- datafr %>%
+  filter (filter == "o")
+
+
+datafr_c <- datafr %>%
+  filter (filter == "c")
+
+datafr_c = datafr_c %>%
+  mutate(date = as.POSIXct('1858-11-17')+(julian_date*24*60*60)) %>%
+  mutate(date = as.Date(format(date,"%Y-%m-%d")))
+
+datafr_o = datafr_o %>%
+  mutate(date = as.POSIXct('1858-11-17')+(julian_date*24*60*60)) %>%
+  mutate(date = as.Date(format(date,"%Y-%m-%d")))
+
+setcolorder(datafr_c,c("date","julian_date","flux","flux_intrinsic","error_flux","filter","quality","series"))
+
+head (datafr_o)
+```
+
+- Rather than taking the actual flux value, we did take a rolling median 5 on flux which would help us in getting much better Flux Intensity and these which will help us in spotting different patterns.
+  
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+
+library(roll)
+Create_rollingWindow_means <- function(df, start_index, num_windows){
+  role_median_1 = seq(from = start_index, to=start_index+num_windows)
+  rol_names <- paste("rolmedian", formatC(role_median_1, width=nchar(max(role_median_1)), flag ="0"), sep="_")
+  
+  rolmedian_function = setNames(paste("roll_median(.,", role_median_1,")"), rol_names)
+  df = df %>%
+    mutate_at(vars(flux), funs_(rolmedian_function))
+  return (df)
+  
+}
+
+datafr_c = Create_rollingWindow_means(datafr_c,1,4)
+datafr_o = Create_rollingWindow_means(datafr_o,1,4)
+datafr_c = na.omit(datafr_c)
+datafr_o = na.omit(datafr_o)
+head(datafr_c)
+
+```
+ 
+ - There are few light curve series which has flux value negative. We are verifying the number of point which are below and if the number is greater than threshold then we create a baseline where 75% of the data is present and moving it to 0 and thus we can see there are some high intensity explosions seen.
+ 
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+
+newdata = data.frame(matrix(ncol=14,nrow=0, dimnames=list(NULL, c("date","julian_date","flux","flux_intrinsic","error_flux","filter","quality","series","flux_balanced","rolmedian_1","rolmedian_2","rolmedian_3","rolmedian_4","rolmedian_5"))))
+for (i in unique(datafr_o$series)){
+  sample = datafr_o
+  
+  neg = datafr_o %>%
+  filter (series == i) %>%
+  filter (flux < 0) %>%
+  count()
+
+  
+  total = datafr_o %>%
+  filter (series == i) %>%
+  count()
+
+  
+  percentage  = (neg / total) *100
+
+  
+  if (percentage > 40){
+    sample = datafr_o %>%
+    filter (series == i) %>%
+    mutate (flux_balanced = rolmedian_5+(IQR(rolmedian_5)))
+  } else
+  {
+    sample = datafr_o %>%
+    filter (series == i) %>%
+    mutate (flux_balanced = rolmedian_5)
+    
+  }
+  
+  newdata <- rbind(newdata, sample)
+
+}
+
+newdata_c = data.frame(matrix(ncol=14,nrow=0, dimnames=list(NULL, c("date","julian_date","flux","flux_intrinsic","error_flux","filter","quality","series","flux_balanced","rolmedian_1","rolmedian_2","rolmedian_3","rolmedian_4","rolmedian_5"))))
+for (i in unique(datafr_c$series)){
+  sample = datafr_c
+  
+  neg = datafr_c %>%
+  filter (series == i) %>%
+  filter (flux < 0) %>%
+  count()
+
+  
+  total = datafr_c %>%
+  filter (series == i) %>%
+  count()
+
+  
+  percentage  = (neg / total) *100
+
+  
+  if (percentage > 40){
+    sample = datafr_c %>%
+    filter (series == i) %>%
+    mutate (flux_balanced = rolmedian_5+(IQR(rolmedian_5)))
+  } else
+  {
+    sample = datafr_c %>%
+    filter (series == i) %>%
+    mutate (flux_balanced = rolmedian_5)
+    
+  }
+  
+  newdata_c <- rbind(newdata_c, sample)
+
+}
+
+
+
+```
+
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+
+sample_new_data <- newdata %>%
+  filter(series %in% sample (unique(newdata$series), size=6, replace =F) )
+
+sample_new_data  %>% 
+  ggplot(aes(x= date, y= flux,color=series)) +
+  geom_line( size=0.2) +
+  ggtitle("Light Curve plots") + 
+  facet_wrap(~ series , scales = 'free_y', nrow= 2) 
+
+sample_new_data  %>% 
+  ggplot(aes(x= date, y= flux_balanced,color=series)) +
+  geom_line( size=0.2) +
+  ggtitle("Light Curve plots with baseline 0") + 
+  facet_wrap(~ series , scales = 'free_y', nrow= 2) 
+
+
+```
+
+ 
+# MACHINE LEARNING (UNSUPERVISED) MODEL
+
+
+### Hierarchial clustering with K shape
+
+As part of Hierarchical clustering model, rather than taking all the files together and treating as one single time series, we decided to deal with each individual light curve, where every file is a time series object. Every object is represented by its unique id.
+
+To make the model execution simpler and to verify the patterns captured by different telescopes we decided to separate the data based on the filters.
+
+Time-series shape extraction based on optimal alignments as proposed by Paparrizos and Gravano (2015) for the k-Shape clustering algorithm is the one of the best approaches proven for clustering out time series. It used cross-correlation distance measure to compare different time series. 
+
+The model was evaluated on clusters range from 5 to 11 for filter 0 and cluster validity indices (CVIs) metrics is used to spot the right optimal model. Within CVI we have different distance measures between the points and definitely the one having the maximum value will be considered as an optimal model and here we see that a model with 8 clusters is giving us good number.
+
+
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+
+df_list <- as.list(utils::unstack(newdata, rolmedian_5 ~ series))
+cluster_list_o = list()
+for (i in 5L:11L){
+  cluster_list_o[[i]] = tsclust(df_list, type = "h", k = i, seed = 42,
+                 distance = "sbd", centroid = shape_extraction,
+                 control = hierarchical_control(method = "complete"))
+    }
+
+```
+
+ 
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+
+cluster_list2_o= cluster_list_o[-which(sapply(cluster_list_o, is.null))]
+clusterlist2_cvi_o = sapply(cluster_list2_o,cvi,type = "internal")
+
+cluster_hc_df_o = clusterlist2_cvi_o %>%
+as.data.frame()
+
+final_hc_df_o <- as.data.frame(t(cluster_hc_df_o))%>%
+mutate(Cluster = 5:11)
+
+head(final_hc_df_o)
+
+final_hc_df_o %>%
+ggplot(aes(x=Cluster,y=CH, color="CH"))+
+geom_line()+
+labs(x="No of clusters", y="CVI (Cluster validity indices)",title = "Hierarchy", color="Variable") +
+theme_minimal()
+
+final_hc_df_o %>%
+ggplot()+
+geom_line(aes(x=Cluster,y=Sil, color="Silhoutte"))+
+geom_line(aes(x=Cluster,y=SF, color="Score function"))+
+geom_line(aes(x=Cluster,y=DB, color="Davies Bouldin"))+
+geom_line(aes(x=Cluster,y=DBstar, color="Davies Bouldin Modified"))+
+geom_line(aes(x=Cluster,y=D, color="Dunn"))+
+geom_line(aes(x=Cluster,y=COP, color="COP"))+
+labs(x="No of clusters", y="CVI (Cluster validity indices)",title = "Hierarchy",color="Variable")+ 
+theme_minimal()
+
+```
+The first set of colorful graphs gives an overview of the series falling under each cluster category, which means all 645 light curves are getting represented here and there other set of graph shows the underlying shape or protype or patterns detected by model and this gives us a clear indication on how some of the light curves don’t fit into any class and some are too noisy to tell.
+
+Cluster category 1,2,4,8 gives a good pattern to Identify Light curve
+Cluster category 3,6,7 is too noisy and may be due to external noise factors and not supernova
+
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+
+optimal_hc =cluster_list_o[[8]]
+plot(optimal_hc, type = "sc")
+plot(optimal_hc, type = "centroid",linetype = "solid")
+
+```
+
+The first table gives the count of light curves falling into each cluster category and second table reference provides a glimpse for each light curve and the cluster bucket its falling into and we also did plot these time series just to make sure it does match with the shapes created by model.
+
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+
+
+optimal_cluster_data = optimal_hc@cluster %>%
+as.data.frame()
+
+op1 = table (optimal_hc@cluster) %>%
+  as.data.frame(col.names = names("Cluster","Count"))
+
+colnames(op1) = c("Cluster Category","Count")
+
+op2 = rbind(head(optimal_cluster_data),tail(optimal_cluster_data))
+colnames(op2) = c("Cluster Category")
+
+op1
+op2
+
+ newdata  %>% 
+  filter (series %in% sample(rownames(op2),4)) %>%
+   ggplot(aes(x= date, y= flux,color=series))+
+   geom_line( size=0.2)+
+   ggtitle("Individual light curve")+
+   facet_wrap(~ series , scales = 'free_y', nrow= 2)
+
+```
+
+
+
+```{r include=FALSE, fig.height=3, fig.width=4}
+# Cropped dendrogram image is highlighting the internal cut by shape algorithm and representing those 8 clusters. 
+plot(optimal_hc, labels=FALSE)
+
+```
+
+
+To be sure about this optimal model with 8 cluster selected we did perform clustering filter c data and yes we did get a good representation of clusters and there pattern. We did get different patterns here because the intensity of explosions captured by both the telescopes are different
+
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+
+df_list <- as.list(utils::unstack(newdata_c, rolmedian_5 ~ series))
+
+optimal_hc_c =tsclust(df_list, type = "h", k = 8L, seed = 42,
+                 distance = "sbd", centroid = shape_extraction,
+                 control = hierarchical_control(method = "complete"))
+plot(optimal_hc_c, type = "sc")
+plot(optimal_hc_c, type = "centroid",linetype = "solid")
+
+```
+
+
+### Hierarchial clustering with Dynamic time wrapping 
+
+The Metrics for Hierarchical Dynamic time wrapping showed no improvement with the clusters formed.
+
+```{r echo=FALSE, fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+
+Sil = c(0.1854152,0.1641961,0.1802415,0.1899439,0.190558,0.1908086,0.1939641)
+SF = c(0.12207209,0.13086889,0.10494959,0.07967956,0.07542527,0.077473,0.06342924)
+DB = c(1.535471,1.572307,1.672307,1.542307,1.372307,1.382307,1.272307)
+D=c(0.02483722,0.02576396,0.02591147,0.02647371,0.02679783,0.02702483,0.02709376)
+DBstar=c(2.126024,2.324427,2.024427,1.924427,1.724427,1.524427,1.324427)
+COP=c(0.3536827,0.307885,0.3014194,0.271863,0.2836204,0.2825687,0.2743051)
+Cluster = 5:11
+data <- data.frame(Sil, SF, DB,DBstar,D,COP,Cluster)
+
+data
+
+data %>%
+ggplot()+
+geom_line(aes(x=Cluster,y=Sil, color="Silhoutte"))+
+geom_line(aes(x=Cluster,y=SF, color="Score function"))+
+geom_line(aes(x=Cluster,y=DB, color="Davies Bouldin"))+
+geom_line(aes(x=Cluster,y=DBstar, color="Davies Bouldin Modified"))+
+geom_line(aes(x=Cluster,y=D, color="Dunn"))+
+geom_line(aes(x=Cluster,y=COP, color="COP"))+
+labs(x="No of clusters", y="CVI (Cluster validity indices)",title = "Hierarchy",color="Variable")+ 
+theme_minimal()
+```
+
+# CONCLUSION
+
+With all the metric values observed and cluster patterns plotted we conclude that Shape extraction Hierarchical model did a balanced grouping within the light curves and gave us the better results and that brings us to the end of the presentation
+
+
+# REFERENCES
+
+- https://cran.r-project.org/web/packages/dtwclust/vignettes/dtwclust.pdf
+- http://rstudio-pubs-static.s3.amazonaws.com/398402_abe1a0343a4e4e03977de8f3791e96bb.html
+- https://rpubs.com/imartinezl/tsclustering
+- https://journal.r-project.org/archive/2019/RJ-2019-023/RJ-2019-023.pdf
+- https://www.programmersought.com/article/71856995021/
+- https://rpubs.com/KaraLynne/382832
+
+
